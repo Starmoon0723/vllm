@@ -417,7 +417,7 @@ async def init_app_state(
 
     if any(task in POOLING_TASKS for task in supported_tasks):
         from vllm.entrypoints.pooling import init_pooling_state
-
+        # test
         init_pooling_state(engine_client, state, args, request_logger, supported_tasks)
 
     if "generate" in supported_tasks:
