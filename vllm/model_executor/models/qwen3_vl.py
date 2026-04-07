@@ -987,9 +987,13 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
         do_sample_frames: bool | None = None,
         sampled_fps: float | None = None,
         sampled_num_frames: int | None = None,
+        sampled_max_frames: int | None = None,
     ) -> list[int]:
         video_processor = self.get_video_processor()
         temporal_patch_size = video_processor.temporal_patch_size
+        effective_max_frames = (
+            sampled_max_frames if sampled_max_frames is not None else video_processor.max_frames
+        )
         indices = metadata["frames_indices"]
 
         # metadata["fps"] refers to the true fps of the input video.
@@ -1015,10 +1019,18 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
                 sampled_fps = sampled_fps if sampled_fps else video_processor.fps
                 num_frames = int(total_num_frames / metadata["fps"] * sampled_fps)
 
+            # num_frames = min(
+            #     min(
+            #         max(num_frames, video_processor.min_frames),
+            #         video_processor.max_frames,
+            #     ),
+            #     total_num_frames,
+            # )effective_max_frames
+
             num_frames = min(
                 min(
                     max(num_frames, video_processor.min_frames),
-                    video_processor.max_frames,
+                    effective_max_frames,
                 ),
                 total_num_frames,
             )
@@ -1226,6 +1238,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     do_sample_frames=video_mm_kwargs["do_sample_frames"],
                     sampled_fps=video_mm_kwargs.get("fps"),
                     sampled_num_frames=video_mm_kwargs.get("num_frames"),
+                    sampled_max_frames=video_mm_kwargs.get("max_frames"),
                 )
                 timestamps_per_video.append(timestamps)
 
