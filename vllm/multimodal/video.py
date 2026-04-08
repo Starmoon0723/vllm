@@ -355,6 +355,33 @@ class OpenCVVideoBackendMixin:
         return frames, valid_frame_indices
 
 
+def _normalize_user_frames_indices(
+    frames_indices: object,
+    total_frames_num: int,
+) -> list[int] | None:
+    if frames_indices is None:
+        return None
+
+    if not isinstance(frames_indices, (list, tuple)):
+        raise TypeError(
+            f"frames_indices must be list/tuple, got {type(frames_indices)}"
+        )
+
+    out: list[int] = []
+    seen = set()
+    for x in frames_indices:
+        i = int(x)
+        if 0 <= i < total_frames_num and i not in seen:
+            out.append(i)
+            seen.add(i)
+
+    if not out:
+        raise ValueError("frames_indices is empty after filtering")
+
+    # 建议显式按时间顺序排序，和视频时序/时间戳保持一致
+    out.sort()
+    return out
+
 @VIDEO_LOADER_REGISTRY.register("opencv")
 class OpenCVVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
     @classmethod
@@ -365,6 +392,14 @@ class OpenCVVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
         **kwargs,
     ) -> list[int]:
         total_frames_num = source.total_frames_num
+
+        user_frame_idx = _normalize_user_frames_indices(
+            kwargs.get("frames_indices"),
+            total_frames_num=total_frames_num,
+        )
+        if user_frame_idx is not None:
+            return user_frame_idx
+
         duration = source.duration
 
         num_frames = target.num_frames
@@ -424,6 +459,7 @@ class OpenCVVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
         frame_idx = cls.compute_frames_index_to_sample(
             source=source,
             target=target,
+            **kwargs,
         )
 
         frames, valid_frame_indices = cls.read_frames(
@@ -439,6 +475,10 @@ class OpenCVVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
             valid_frame_indices=valid_frame_indices,
         )
 
+        if kwargs.get("frames_indices") is not None:
+            metadata["user_frames_indices"] = True
+            metadata["do_sample_frames"] = False
+
         return frames, metadata
 
 
@@ -452,6 +492,14 @@ class OpenCVDynamicVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
         **kwargs,
     ) -> list[int]:
         total_frames_num = source.total_frames_num
+
+        user_frame_idx = _normalize_user_frames_indices(
+            kwargs.get("frames_indices"),
+            total_frames_num=total_frames_num,
+        )
+        if user_frame_idx is not None:
+            return user_frame_idx
+
         duration = source.duration
         original_fps = source.original_fps
         max_duration = target.max_duration
@@ -530,6 +578,7 @@ class OpenCVDynamicVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
         frame_indices_list = cls.compute_frames_index_to_sample(
             source=source,
             target=target,
+            **kwargs,
         )
 
         frames, valid_frame_indices = cls.read_frames(
@@ -544,6 +593,10 @@ class OpenCVDynamicVideoBackend(VideoLoader, OpenCVVideoBackendMixin):
             video_backend="opencv_dynamic",
             valid_frame_indices=valid_frame_indices,
         )
+
+        if kwargs.get("frames_indices") is not None:
+            metadata["user_frames_indices"] = True
+            metadata["do_sample_frames"] = False
 
         return frames, metadata
 

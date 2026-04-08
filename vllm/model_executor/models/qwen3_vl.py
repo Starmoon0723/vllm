@@ -989,6 +989,18 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
         sampled_num_frames: int | None = None,
         sampled_max_frames: int | None = None,
     ) -> list[int]:
+        # 1) 显式自定义帧优先
+        if getattr(metadata, "user_frames_indices", False):
+            indices = list(metadata.frames_indices)
+            video_fps = float(metadata.fps)
+            video_processor = self.get_video_processor()
+
+            return self._calculate_timestamps(
+                indices=indices,
+                video_fps=video_fps,
+                temporal_patch_size=video_processor.temporal_patch_size,
+            )
+
         video_processor = self.get_video_processor()
         temporal_patch_size = video_processor.temporal_patch_size
         effective_max_frames = (
