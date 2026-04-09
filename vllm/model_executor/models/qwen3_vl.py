@@ -988,9 +988,10 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
         sampled_fps: float | None = None,
         sampled_num_frames: int | None = None,
         sampled_max_frames: int | None = None,
+        user_frames_indices: bool | None = None,
     ) -> list[int]:
         # 1) 显式自定义帧优先
-        if getattr(metadata, "user_frames_indices", False):
+        if user_frames_indices:
             indices = list(metadata.frames_indices)
             video_fps = float(metadata.fps)
             video_processor = self.get_video_processor()
@@ -998,7 +999,7 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
             return self._calculate_timestamps(
                 indices=indices,
                 video_fps=video_fps,
-                temporal_patch_size=video_processor.temporal_patch_size,
+                merge_size=video_processor.temporal_patch_size,
             )
 
         video_processor = self.get_video_processor()
@@ -1240,6 +1241,8 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                         "do_sample_frames", False
                     )
 
+                user_frames_indices = metadata.pop("user_frames_indices", False)
+
                 metadata = VideoMetadata(
                     **{k: metadata[k] for k in metadata if k != "do_sample_frames"}
                 )
@@ -1251,6 +1254,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     sampled_fps=video_mm_kwargs.get("fps"),
                     sampled_num_frames=video_mm_kwargs.get("num_frames"),
                     sampled_max_frames=video_mm_kwargs.get("max_frames"),
+                    user_frames_indices=user_frames_indices,
                 )
                 timestamps_per_video.append(timestamps)
 
