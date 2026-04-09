@@ -140,6 +140,28 @@ from .vision import (
     run_dp_sharded_mrope_vision_model,
 )
 
+import os
+import json
+import hashlib
+
+def _debug_enabled() -> bool:
+    return os.getenv("VLLM_DEBUG_VIDEO_COMPARE", "0") == "1"
+
+def _short_list(xs, n=8):
+    xs = list(xs)
+    if len(xs) <= 2 * n:
+        return xs
+    return xs[:n] + ["..."] + xs[-n:]
+
+def _hash_list(xs) -> str:
+    data = json.dumps(list(xs), ensure_ascii=False).encode("utf-8")
+    return hashlib.md5(data).hexdigest()
+
+def _debug_video_log(tag: str, payload: dict):
+    if not _debug_enabled():
+        return
+    print(f"[VIDEO_DEBUG][{tag}] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
 logger = init_logger(__name__)
 
 # We use 2048 dummy video frames that would generate vision embeddings
@@ -1054,6 +1076,24 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
                 .tolist()
             )
         timestamps = self._calculate_timestamps(indices, video_fps, temporal_patch_size)
+
+        _debug_video_log(
+            "vllm_timestamps",
+            {
+                "do_sample_frames": do_sample_frames,
+                "sampled_fps": sampled_fps,
+                "sampled_num_frames": sampled_num_frames,
+                "sampled_max_frames": sampled_max_frames,
+                "video_fps": video_fps,
+                "temporal_patch_size": temporal_patch_size,
+                "indices_len": len(indices),
+                "indices_hash": _hash_list(indices),
+                "indices_preview": _short_list(indices),
+                "timestamps_len": len(timestamps),
+                "timestamps_preview": _short_list([round(x, 4) for x in timestamps]),
+            },
+        )
+
         return timestamps
 
 
