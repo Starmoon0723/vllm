@@ -172,6 +172,108 @@ def _debug_video_log(tag: str, payload: dict):
         return
     print(f"[VIDEO_DEBUG][{tag}] {json.dumps(payload, ensure_ascii=False)}", flush=True)
 
+
+def _normalize_video_token_keep_indices(
+    token_keep_indices: Any,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+) -> list[list[int]] | None:
+    """Normalize user-provided per-frame token indices.
+
+    Supports two formats:
+    1) per-frame format: ``List[List[int]]`` where each inner list contains
+       token indices in [0, tokens_per_frame) for that frame.
+    2) flattened global format: ``List[int]`` where each index is in
+       [0, num_frames * tokens_per_frame), and is mapped to (frame, local_id).
+    """
+    if token_keep_indices is None:
+        return None
+
+    if isinstance(token_keep_indices, torch.Tensor):
+        token_keep_indices = token_keep_indices.detach().cpu().tolist()
+    elif isinstance(token_keep_indices, np.ndarray):
+        token_keep_indices = token_keep_indices.tolist()
+
+    if not isinstance(token_keep_indices, (list, tuple)):
+        return None
+
+    def _normalize_one_frame(indices_any: Any) -> list[int]:
+        if isinstance(indices_any, torch.Tensor):
+            indices_any = indices_any.detach().cpu().tolist()
+        elif isinstance(indices_any, np.ndarray):
+            indices_any = indices_any.tolist()
+        if not isinstance(indices_any, (list, tuple)):
+            return []
+        out: list[int] = []
+        for x in indices_any:
+            try:
+                ix = int(x)
+            except Exception:
+                continue
+            if 0 <= ix < tokens_per_frame:
+                out.append(ix)
+        return sorted(set(out))
+
+    # Per-frame nested format.
+    if len(token_keep_indices) == 0 or any(
+        isinstance(x, (list, tuple, torch.Tensor, np.ndarray))
+        for x in token_keep_indices
+    ):
+        normalized: list[list[int]] = []
+        for frame_idx in range(num_frames):
+            src = token_keep_indices[frame_idx] if frame_idx < len(token_keep_indices) else []
+            normalized.append(_normalize_one_frame(src))
+        return normalized
+
+    # Flattened global format.
+    total_tokens = num_frames * tokens_per_frame
+    normalized = [[] for _ in range(num_frames)]
+    for x in token_keep_indices:
+        try:
+            gidx = int(x)
+        except Exception:
+            continue
+        if gidx < 0 or gidx >= total_tokens:
+            continue
+        frame_idx = gidx // tokens_per_frame
+        local_idx = gidx % tokens_per_frame
+        normalized[frame_idx].append(local_idx)
+    return [sorted(set(v)) for v in normalized]
+
+
+def _build_retention_mask_from_keep_indices(
+    token_keep_indices: list[list[int]],
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, list[int]]:
+    """Build flattened retention mask from per-frame kept token indices."""
+    retention_mask = torch.zeros(
+        num_frames * tokens_per_frame,
+        dtype=torch.bool,
+        device=device,
+    )
+    num_tokens_per_frame: list[int] = []
+    for frame_idx in range(num_frames):
+        indices = token_keep_indices[frame_idx] if frame_idx < len(token_keep_indices) else []
+        uniq_indices_set: set[int] = set()
+        for i in indices:
+            try:
+                idx = int(i)
+            except Exception:
+                continue
+            if 0 <= idx < tokens_per_frame:
+                uniq_indices_set.add(idx)
+        uniq_indices = sorted(uniq_indices_set)
+        if len(uniq_indices) > 0:
+            offset = frame_idx * tokens_per_frame
+            retention_mask[offset + torch.tensor(uniq_indices, device=device)] = True
+        num_tokens_per_frame.append(len(uniq_indices))
+    return retention_mask, num_tokens_per_frame
+
+
 logger = init_logger(__name__)
 
 # We use 2048 dummy video frames that would generate vision embeddings
@@ -1272,6 +1374,8 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             video_grid_thw_lst = []
             pixel_values_videos_lst = []
             timestamps_per_video = []
+            video_token_keep_indices_lst = []
+            pruning_enabled = self.info.ctx.get_mm_config().is_multimodal_pruning_enabled()
 
             for item in videos:
                 video_array, metadata = item
@@ -1292,6 +1396,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     )
 
                 user_frames_indices = metadata.pop("user_frames_indices", False)
+                user_token_keep_indices = metadata.pop("video_token_keep_indices", None)
 
                 metadata = VideoMetadata(
                     **{k: metadata[k] for k in metadata if k != "do_sample_frames"}
@@ -1390,10 +1495,27 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 tokens_per_frame_base = int(video_grid_thw[0, 1:].prod()) // (
                     merge_size**2
                 )
+                normalized_token_keep_indices = _normalize_video_token_keep_indices(
+                    user_token_keep_indices,
+                    num_frames=num_frames,
+                    tokens_per_frame=tokens_per_frame_base,
+                )
+                if normalized_token_keep_indices is not None and not pruning_enabled:
+                    logger.warning(
+                        "Received `video_token_keep_indices` but multimodal pruning is disabled. "
+                        "Ignoring custom token indices."
+                    )
+                    normalized_token_keep_indices = None
+                video_token_keep_indices_lst.append(normalized_token_keep_indices)
 
                 # Apply EVS if enabled.
                 video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
-                if video_pruning_rate is not None and video_pruning_rate > 0.0:
+                if normalized_token_keep_indices is not None:
+                    tokens_per_frame = [len(v) for v in normalized_token_keep_indices]
+                    # Keep timestamp / structure tokens in replacement and let
+                    # model-side pruning logic place visual embeddings.
+                    select_token_id = False
+                elif video_pruning_rate is not None and video_pruning_rate > 0.0:
                     num_tokens = compute_retained_tokens_count(
                         tokens_per_frame=tokens_per_frame_base,
                         num_frames=num_frames,
@@ -1440,6 +1562,8 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                 video_grid_thw=torch.cat(video_grid_thw_lst),
                 timestamps=timestamps_per_video,
             )
+            if any(v is not None for v in video_token_keep_indices_lst):
+                video_outputs["video_token_keep_indices"] = video_token_keep_indices_lst
         else:
             video_outputs = dict()
 
@@ -1460,9 +1584,15 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return _create_qwen2vl_field_factory(
+        fields_config = _create_qwen2vl_field_factory(
             self.info.get_hf_config().vision_config.spatial_merge_size
         )(hf_inputs)
+        if "video_token_keep_indices" in hf_inputs:
+            fields_config = dict(fields_config)
+            fields_config["video_token_keep_indices"] = MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            )
+        return fields_config
 
     def _get_prompt_updates(
         self,
@@ -1508,8 +1638,22 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             num_frames = int(grid_thw[0])
             tokens_per_frame_base = int(grid_thw[1:].prod()) // merge_length
 
+            normalized_token_keep_indices = None
+            pruning_enabled = self.info.ctx.get_mm_config().is_multimodal_pruning_enabled()
+            if "video_token_keep_indices" in out_item:
+                normalized_token_keep_indices = _normalize_video_token_keep_indices(
+                    out_item["video_token_keep_indices"].data,
+                    num_frames=num_frames,
+                    tokens_per_frame=tokens_per_frame_base,
+                )
+                if normalized_token_keep_indices is not None and not pruning_enabled:
+                    normalized_token_keep_indices = None
+
             video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
-            if video_pruning_rate is not None and video_pruning_rate > 0.0:
+            if normalized_token_keep_indices is not None:
+                tokens_per_frame = [len(v) for v in normalized_token_keep_indices]
+                select_token_id = False
+            elif video_pruning_rate is not None and video_pruning_rate > 0.0:
                 num_tokens = compute_retained_tokens_count(
                     tokens_per_frame=tokens_per_frame_base,
                     num_frames=num_frames,
@@ -2070,6 +2214,7 @@ class Qwen3VLForConditionalGeneration(
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         timestamps = kwargs.pop("timestamps", None)
+        video_token_keep_indices = kwargs.pop("video_token_keep_indices", None)
 
         if pixel_values_videos is None and video_embeds is None:
             return None
@@ -2081,6 +2226,7 @@ class Qwen3VLForConditionalGeneration(
                 video_grid_thw=video_grid_thw,
                 second_per_grid_ts=second_per_grid_ts,
                 timestamps=timestamps,
+                video_token_keep_indices=video_token_keep_indices,
             )
 
         if video_embeds is not None:
@@ -2089,6 +2235,7 @@ class Qwen3VLForConditionalGeneration(
                 video_embeds=video_embeds,
                 video_grid_thw=video_grid_thw,
                 timestamps=timestamps,
+                video_token_keep_indices=video_token_keep_indices,
             )
 
     def _process_image_input(
@@ -2237,6 +2384,7 @@ class Qwen3VLForConditionalGeneration(
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
         merge_size = self.visual.spatial_merge_size
+        token_keep_indices_all = video_input.get("video_token_keep_indices", None)
 
         # Apply EVS to each video.
         video_embeds_out = []
@@ -2246,7 +2394,30 @@ class Qwen3VLForConditionalGeneration(
             num_frames = len(timestamps)
 
             t, h, w = size
-            if self.is_multimodal_pruning_enabled:
+            rows = h // merge_size
+            cols = w // merge_size
+            tokens_per_frame_base = rows * cols
+            normalized_token_keep_indices = None
+            if (
+                token_keep_indices_all is not None
+                and isinstance(token_keep_indices_all, (list, tuple))
+                and video_idx < len(token_keep_indices_all)
+            ):
+                normalized_token_keep_indices = _normalize_video_token_keep_indices(
+                    token_keep_indices_all[video_idx],
+                    num_frames=t,
+                    tokens_per_frame=tokens_per_frame_base,
+                )
+
+            if normalized_token_keep_indices is not None:
+                retention_mask, num_tokens_per_frame = _build_retention_mask_from_keep_indices(
+                    normalized_token_keep_indices,
+                    num_frames=t,
+                    tokens_per_frame=tokens_per_frame_base,
+                    device=emb.device,
+                )
+                emb = emb[retention_mask]
+            elif self.is_multimodal_pruning_enabled:
                 # For each video, compute retention mask using EVS.
                 # retention_mask: [11424].
                 retention_mask = compute_retention_mask(
@@ -2259,11 +2430,7 @@ class Qwen3VLForConditionalGeneration(
                 emb = emb[retention_mask]
 
                 # Calculate the actual number of retained tokens per frame.
-                num_frames, rows, cols = (
-                    t,
-                    h // merge_size,
-                    w // merge_size,
-                )
+                num_frames = t
                 retention_mask_thw = retention_mask.reshape(num_frames, rows, cols)
                 num_tokens_per_frame = (
                     retention_mask_thw.sum(dim=(1, 2)).long().tolist()
