@@ -157,6 +157,16 @@ def _hash_list(xs) -> str:
     data = json.dumps(list(xs), ensure_ascii=False).encode("utf-8")
     return hashlib.md5(data).hexdigest()
 
+def _shape_list(x):
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return list(x.shape)
+    try:
+        return list(np.asarray(x).shape)
+    except Exception:
+        return str(type(x))
+
 def _debug_video_log(tag: str, payload: dict):
     if not _debug_enabled():
         return
@@ -1316,6 +1326,63 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     tok_kwargs=tok_kwargs,
                 )
 
+                # add debug log
+                video_grid_thw = video_outputs["video_grid_thw"]
+                pixel_values_videos = video_outputs["pixel_values_videos"]
+
+                vision_config = self.info.get_hf_config().vision_config
+                patch_size = int(vision_config.patch_size)
+                temporal_patch_size = int(vision_config.temporal_patch_size)
+                spatial_merge_size = int(vision_config.spatial_merge_size)
+
+                assert video_grid_thw.ndim == 2 and video_grid_thw.shape[0] == 1, (
+                    f"Expected single-video grid_thw with shape (1, 3), got {video_grid_thw.shape}"
+                )
+
+                grid_t, grid_h, grid_w = [int(x) for x in video_grid_thw[0].tolist()]
+                encoder_input_patches = int(grid_t * grid_h * grid_w)
+                llm_video_tokens_before_evs = int(
+                    encoder_input_patches // (spatial_merge_size ** 2)
+                )
+
+                # sampled_frames_before_pad = len(indices)
+                raw_frames_indices = getattr(metadata, "frames_indices", None)
+                if raw_frames_indices is not None:
+                    sampled_frames_before_pad = len(raw_frames_indices)
+                    frames_indices_hash_before_pad = _hash_list(raw_frames_indices)
+                else:
+                    sampled_frames_before_pad = None
+                    frames_indices_hash_before_pad = None
+                sampled_frames_after_pad = int(grid_t * temporal_patch_size)
+                resized_height = int(grid_h * patch_size)
+                resized_width = int(grid_w * patch_size)
+
+                _debug_video_log(
+                    "hf_video_outputs",
+                    {
+                        "video_array_shape": _shape_list(video_array),
+                        "metadata_fps": float(metadata["fps"]),
+                        "metadata_total_num_frames": int(metadata["total_num_frames"]),
+                        # "frames_indices_len_before_pad": sampled_frames_before_pad,
+                        # "frames_indices_hash_before_pad": _hash_list(indices),
+                        "frames_indices_len_before_pad": sampled_frames_before_pad,
+                        "frames_indices_hash_before_pad": frames_indices_hash_before_pad,
+                        "pixel_values_videos_shape": _shape_list(pixel_values_videos),
+                        "video_grid_thw_shape": _shape_list(video_grid_thw),
+                        "video_grid_thw_value": [grid_t, grid_h, grid_w],
+                        "patch_size": patch_size,
+                        "temporal_patch_size": temporal_patch_size,
+                        "spatial_merge_size": spatial_merge_size,
+                        "sampled_frames_after_pad": sampled_frames_after_pad,
+                        "resized_frame_hw": [resized_height, resized_width],
+                        "encoder_input_patches": encoder_input_patches,
+                        "llm_video_tokens_before_evs": llm_video_tokens_before_evs,
+                        "pixel_values_rows_match_grid": (
+                            int(pixel_values_videos.shape[0]) == encoder_input_patches
+                        ),
+                    },
+                )
+
                 merge_size = processor.video_processor.merge_size
                 # Get video grid info for EVS calculation.
                 video_grid_thw = video_outputs["video_grid_thw"]
@@ -2058,6 +2125,42 @@ class Qwen3VLForConditionalGeneration(
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype
             )
+
+            # add debug log before into vit
+            if _debug_enabled():
+                grid_thw_list = video_input["video_grid_thw"].tolist()
+                per_video_stats = []
+                merge_size = int(self.visual.spatial_merge_size)
+                patch_size = int(self.visual.patch_size)
+                temporal_patch_size = int(self.visual.temporal_patch_size)
+
+                for video_idx, (t, h, w) in enumerate(grid_thw_list):
+                    t, h, w = int(t), int(h), int(w)
+                    encoder_input_patches = int(t * h * w)
+                    llm_video_tokens_before_evs = int(
+                        encoder_input_patches // (merge_size ** 2)
+                    )
+                    per_video_stats.append(
+                        {
+                            "video_idx": video_idx,
+                            "video_grid_thw": [t, h, w],
+                            "sampled_frames_after_pad": int(t * temporal_patch_size),
+                            "resized_frame_hw": [int(h * patch_size), int(w * patch_size)],
+                            "encoder_input_patches": encoder_input_patches,
+                            "llm_video_tokens_before_evs": llm_video_tokens_before_evs,
+                        }
+                    )
+
+                _debug_video_log(
+                    "before_visual_forward",
+                    {
+                        "pixel_values_videos_shape": _shape_list(pixel_values_videos),
+                        "video_grid_thw_shape": _shape_list(video_input["video_grid_thw"]),
+                        "video_count": len(grid_thw_list),
+                        "per_video_stats": per_video_stats,
+                    },
+                )
+
             if self.use_data_parallel:
                 grid_thw_list = grid_thw.tolist()
                 return run_dp_sharded_mrope_vision_model(
