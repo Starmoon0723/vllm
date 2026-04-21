@@ -274,6 +274,75 @@ def _build_retention_mask_from_keep_indices(
     return retention_mask, num_tokens_per_frame
 
 
+_VIDEO_PRUNE_STAGE_EMBEDDING = "embedding"
+_VIDEO_PRUNE_STAGE_RGB_PRE_VIT = "rgb_pre_vit"
+
+
+def _normalize_video_token_pruning_stage(stage: Any) -> str:
+    if stage is None:
+        return _VIDEO_PRUNE_STAGE_EMBEDDING
+    stage_str = str(stage).strip().lower()
+    if stage_str in {
+        _VIDEO_PRUNE_STAGE_EMBEDDING,
+        "vit_embedding",
+        "embedding_post_vit",
+    }:
+        return _VIDEO_PRUNE_STAGE_EMBEDDING
+    if stage_str in {
+        _VIDEO_PRUNE_STAGE_RGB_PRE_VIT,
+        "rgb",
+        "pre_vit",
+        "pixel",
+    }:
+        return _VIDEO_PRUNE_STAGE_RGB_PRE_VIT
+    logger.warning(
+        "Unknown video_token_pruning_stage `%s`, fallback to `%s`.",
+        stage,
+        _VIDEO_PRUNE_STAGE_EMBEDDING,
+    )
+    return _VIDEO_PRUNE_STAGE_EMBEDDING
+
+
+def _resolve_video_token_pruning_stage(
+    stage_value: Any,
+    *,
+    video_idx: int,
+) -> str:
+    if isinstance(stage_value, (list, tuple)):
+        if video_idx < len(stage_value):
+            return _normalize_video_token_pruning_stage(stage_value[video_idx])
+        return _VIDEO_PRUNE_STAGE_EMBEDDING
+    return _normalize_video_token_pruning_stage(stage_value)
+
+
+def _expand_llm_keep_indices_to_patch_indices(
+    token_keep_indices: list[list[int]],
+    *,
+    num_frames: int,
+    grid_h: int,
+    grid_w: int,
+    spatial_merge_size: int,
+) -> list[list[int]]:
+    patches_per_frame = grid_h * grid_w
+    merge_tokens_per_frame = patches_per_frame // (spatial_merge_size**2)
+    patch_group_size = spatial_merge_size**2
+    out: list[list[int]] = []
+    for frame_idx in range(num_frames):
+        keep_token_ids = (
+            token_keep_indices[frame_idx] if frame_idx < len(token_keep_indices) else []
+        )
+        frame_patch_indices: list[int] = []
+        for token_idx in keep_token_ids:
+            if token_idx < 0 or token_idx >= merge_tokens_per_frame:
+                continue
+            patch_offset = token_idx * patch_group_size
+            frame_patch_indices.extend(
+                range(patch_offset, patch_offset + patch_group_size)
+            )
+        out.append(sorted(set(frame_patch_indices)))
+    return out
+
+
 logger = init_logger(__name__)
 
 # We use 2048 dummy video frames that would generate vision embeddings
@@ -902,6 +971,89 @@ class Qwen3_VisionTransformer(nn.Module):
 
         return metadata
 
+    def prepare_encoder_metadata_with_frame_patch_indices(
+        self,
+        grid_thw: list[int],
+        frame_patch_indices: list[list[int]],
+        *,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor | None]:
+        if device is None:
+            device = self.device
+        t, h, w = [int(v) for v in grid_thw]
+        if len(frame_patch_indices) != t:
+            raise ValueError(
+                f"frame_patch_indices length mismatch: expected {t}, got {len(frame_patch_indices)}."
+            )
+
+        patches_per_frame = h * w
+        global_patch_indices: list[int] = []
+        frame_patch_counts: list[int] = []
+        for frame_idx in range(t):
+            raw_indices = frame_patch_indices[frame_idx]
+            unique_indices = sorted(
+                {
+                    int(i)
+                    for i in raw_indices
+                    if isinstance(i, (int, np.integer))
+                    or (isinstance(i, str) and i.isdigit())
+                }
+            )
+            filtered_indices = [i for i in unique_indices if 0 <= i < patches_per_frame]
+            frame_patch_counts.append(len(filtered_indices))
+            frame_offset = frame_idx * patches_per_frame
+            global_patch_indices.extend(frame_offset + i for i in filtered_indices)
+
+        if len(global_patch_indices) == 0:
+            raise ValueError(
+                "No patch kept for rgb_pre_vit pruning; fallback to embedding pruning."
+            )
+
+        full_pos_embeds = self.fast_pos_embed_interpolate([[t, h, w]])
+        index_tensor = torch.tensor(
+            global_patch_indices,
+            dtype=torch.long,
+            device=full_pos_embeds.device,
+        )
+        pos_embeds = full_pos_embeds.index_select(0, index_tensor)
+
+        frame_pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
+        full_pos_ids = frame_pos_ids.repeat(t, 1).to(self.device, non_blocking=True)
+        selected_pos_ids = full_pos_ids.index_select(
+            0, index_tensor.to(device=full_pos_ids.device)
+        )
+        max_grid_size = max(h, w)
+        cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+        rotary_cos = cos[selected_pos_ids].flatten(1)
+        rotary_sin = sin[selected_pos_ids].flatten(1)
+
+        cu_seqlens = np.concatenate(
+            [
+                np.zeros(1, dtype=np.int32),
+                np.cumsum(np.array(frame_patch_counts, dtype=np.int32)),
+            ]
+        )
+        metadata: dict[str, torch.Tensor | None] = {
+            "pos_embeds": pos_embeds,
+            "rotary_pos_emb_cos": rotary_cos,
+            "rotary_pos_emb_sin": rotary_sin,
+            "sequence_lengths": MMEncoderAttention.maybe_compute_seq_lens(
+                self.attn_backend, cu_seqlens, device
+            ),
+            "max_seqlen": torch.tensor(
+                MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
+                dtype=torch.int32,
+            ),
+            "cu_seqlens": MMEncoderAttention.maybe_recompute_cu_seqlens(
+                self.attn_backend,
+                cu_seqlens,
+                self.hidden_size,
+                self.tp_size,
+                device,
+            ),
+        }
+        return metadata
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1375,6 +1527,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             pixel_values_videos_lst = []
             timestamps_per_video = []
             video_token_keep_indices_lst = []
+            video_token_pruning_stage_lst = []
             pruning_enabled = self.info.ctx.get_mm_config().is_multimodal_pruning_enabled()
 
             for item in videos:
@@ -1397,6 +1550,13 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
 
                 user_frames_indices = metadata.pop("user_frames_indices", False)
                 user_token_keep_indices = metadata.pop("video_token_keep_indices", None)
+                user_token_pruning_stage = metadata.pop(
+                    "video_token_pruning_stage",
+                    mm_kwargs.get("video_token_pruning_stage", None),
+                )
+                user_token_pruning_stage = _normalize_video_token_pruning_stage(
+                    user_token_pruning_stage
+                )
 
                 metadata = VideoMetadata(
                     **{k: metadata[k] for k in metadata if k != "do_sample_frames"}
@@ -1507,6 +1667,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     )
                     normalized_token_keep_indices = None
                 video_token_keep_indices_lst.append(normalized_token_keep_indices)
+                video_token_pruning_stage_lst.append(user_token_pruning_stage)
 
                 # Apply EVS if enabled.
                 video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
@@ -1564,6 +1725,7 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             )
             if any(v is not None for v in video_token_keep_indices_lst):
                 video_outputs["video_token_keep_indices"] = video_token_keep_indices_lst
+                video_outputs["video_token_pruning_stage"] = video_token_pruning_stage_lst
         else:
             video_outputs = dict()
 
@@ -1590,6 +1752,9 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         if "video_token_keep_indices" in hf_inputs:
             fields_config = dict(fields_config)
             fields_config["video_token_keep_indices"] = MultiModalFieldConfig.batched(
+                "video", keep_on_cpu=True
+            )
+            fields_config["video_token_pruning_stage"] = MultiModalFieldConfig.batched(
                 "video", keep_on_cpu=True
             )
         return fields_config
@@ -2215,6 +2380,7 @@ class Qwen3VLForConditionalGeneration(
         second_per_grid_ts = kwargs.pop("second_per_grid_ts", None)
         timestamps = kwargs.pop("timestamps", None)
         video_token_keep_indices = kwargs.pop("video_token_keep_indices", None)
+        video_token_pruning_stage = kwargs.pop("video_token_pruning_stage", None)
 
         if pixel_values_videos is None and video_embeds is None:
             return None
@@ -2227,6 +2393,7 @@ class Qwen3VLForConditionalGeneration(
                 second_per_grid_ts=second_per_grid_ts,
                 timestamps=timestamps,
                 video_token_keep_indices=video_token_keep_indices,
+                video_token_pruning_stage=video_token_pruning_stage,
             )
 
         if video_embeds is not None:
@@ -2236,6 +2403,7 @@ class Qwen3VLForConditionalGeneration(
                 video_grid_thw=video_grid_thw,
                 timestamps=timestamps,
                 video_token_keep_indices=video_token_keep_indices,
+                video_token_pruning_stage=video_token_pruning_stage,
             )
 
     def _process_image_input(
@@ -2266,8 +2434,43 @@ class Qwen3VLForConditionalGeneration(
         grid_thw = video_input["video_grid_thw"]
         assert grid_thw.ndim == 2
 
+        grid_thw_list = [[int(v) for v in row] for row in grid_thw.tolist()]
+        merge_size = int(self.visual.spatial_merge_size)
+        token_keep_indices_all = video_input.get("video_token_keep_indices", None)
+        token_pruning_stage_all = video_input.get("video_token_pruning_stage", None)
+
+        normalized_token_keep_indices_all: list[list[list[int]] | None] = []
+        rgb_pre_vit_flags: list[bool] = []
+        for video_idx, (t, h, w) in enumerate(grid_thw_list):
+            tokens_per_frame_base = (h * w) // (merge_size**2)
+            normalized_keep = None
+            if (
+                token_keep_indices_all is not None
+                and isinstance(token_keep_indices_all, (list, tuple))
+                and video_idx < len(token_keep_indices_all)
+            ):
+                normalized_keep = _normalize_video_token_keep_indices(
+                    token_keep_indices_all[video_idx],
+                    num_frames=t,
+                    tokens_per_frame=tokens_per_frame_base,
+                )
+            normalized_token_keep_indices_all.append(normalized_keep)
+            pruning_stage = _resolve_video_token_pruning_stage(
+                token_pruning_stage_all, video_idx=video_idx
+            )
+            rgb_pre_vit_flags.append(
+                pruning_stage == _VIDEO_PRUNE_STAGE_RGB_PRE_VIT
+                and normalized_keep is not None
+            )
+
         if video_input["type"] == "video_embeds":
             video_embeds = video_input["video_embeds"].type(self.visual.dtype)
+            video_output_sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
+            if any(rgb_pre_vit_flags):
+                logger.warning(
+                    "rgb_pre_vit pruning requires `pixel_values_videos`; got `video_embeds`. "
+                    "Fallback to embedding-stage pruning."
+                )
         else:
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype
@@ -2308,18 +2511,88 @@ class Qwen3VLForConditionalGeneration(
                     },
                 )
 
-            if self.use_data_parallel:
-                grid_thw_list = grid_thw.tolist()
+            if any(rgb_pre_vit_flags) and self.use_data_parallel:
+                logger.warning(
+                    "rgb_pre_vit pruning is not supported with data-parallel vision encoder. "
+                    "Fallback to embedding-stage pruning."
+                )
+                rgb_pre_vit_flags = [False] * len(rgb_pre_vit_flags)
+
+            if self.use_data_parallel and not any(rgb_pre_vit_flags):
                 return run_dp_sharded_mrope_vision_model(
                     self.visual, pixel_values_videos, grid_thw_list, rope_type="rope_3d"
                 )
-            else:
+
+            if not any(rgb_pre_vit_flags):
                 video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
+                video_output_sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
+            else:
+                per_video_patch_counts = [int(np.prod(v)) for v in grid_thw_list]
+                pixel_values_split = pixel_values_videos.split(per_video_patch_counts, dim=0)
+                video_embeds_list: list[torch.Tensor] = []
+                video_output_sizes: list[int] = []
+                for video_idx, (pixel_values_one, size) in enumerate(
+                    zip(pixel_values_split, grid_thw_list)
+                ):
+                    t, h, w = size
+                    base_tokens_per_frame = (h * w) // (merge_size**2)
+                    base_output_size = t * base_tokens_per_frame
+                    normalized_keep = normalized_token_keep_indices_all[video_idx]
+                    if not (rgb_pre_vit_flags[video_idx] and normalized_keep is not None):
+                        video_embeds_one = self.visual(pixel_values_one, grid_thw=[size])
+                        video_embeds_list.append(video_embeds_one)
+                        video_output_sizes.append(base_output_size)
+                        continue
+
+                    frame_patch_indices = _expand_llm_keep_indices_to_patch_indices(
+                        normalized_keep,
+                        num_frames=t,
+                        grid_h=h,
+                        grid_w=w,
+                        spatial_merge_size=merge_size,
+                    )
+                    flat_mask = torch.zeros(
+                        t * h * w, device=pixel_values_one.device, dtype=torch.bool
+                    )
+                    for frame_idx, patch_indices in enumerate(frame_patch_indices):
+                        if len(patch_indices) == 0:
+                            continue
+                        offset = frame_idx * h * w
+                        local_idx_tensor = torch.tensor(
+                            patch_indices,
+                            device=flat_mask.device,
+                            dtype=torch.long,
+                        )
+                        flat_mask[offset + local_idx_tensor] = True
+
+                    if int(flat_mask.sum().item()) == 0:
+                        logger.warning(
+                            "Video %d has empty keep set in rgb_pre_vit stage. "
+                            "Fallback to embedding-stage pruning.",
+                            video_idx,
+                        )
+                        video_embeds_one = self.visual(pixel_values_one, grid_thw=[size])
+                        video_embeds_list.append(video_embeds_one)
+                        video_output_sizes.append(base_output_size)
+                        continue
+
+                    pixel_values_pruned = pixel_values_one[flat_mask]
+                    encoder_metadata = self.visual.prepare_encoder_metadata_with_frame_patch_indices(
+                        size,
+                        frame_patch_indices,
+                        device=pixel_values_pruned.device,
+                    )
+                    video_embeds_one = self.visual(
+                        pixel_values_pruned,
+                        grid_thw=[size],
+                        encoder_metadata=encoder_metadata,
+                    )
+                    video_embeds_list.append(video_embeds_one)
+                    video_output_sizes.append(sum(len(v) for v in normalized_keep))
+                video_embeds = torch.cat(video_embeds_list, dim=0)
 
         # Split concatenated embeddings for each video item.
-        merge_size = self.visual.spatial_merge_size
-        sizes = (grid_thw.prod(-1) // merge_size // merge_size).tolist()
-        return video_embeds.split(sizes)
+        return video_embeds.split(video_output_sizes)
 
     def _postprocess_image_embeds_evs(
         self,
@@ -2385,6 +2658,7 @@ class Qwen3VLForConditionalGeneration(
         grid_thw_list = grid_thw.tolist()
         merge_size = self.visual.spatial_merge_size
         token_keep_indices_all = video_input.get("video_token_keep_indices", None)
+        token_pruning_stage_all = video_input.get("video_token_pruning_stage", None)
 
         # Apply EVS to each video.
         video_embeds_out = []
@@ -2408,6 +2682,9 @@ class Qwen3VLForConditionalGeneration(
                     num_frames=t,
                     tokens_per_frame=tokens_per_frame_base,
                 )
+            pruning_stage = _resolve_video_token_pruning_stage(
+                token_pruning_stage_all, video_idx=video_idx
+            )
 
             if normalized_token_keep_indices is not None:
                 retention_mask, num_tokens_per_frame = _build_retention_mask_from_keep_indices(
@@ -2416,7 +2693,8 @@ class Qwen3VLForConditionalGeneration(
                     tokens_per_frame=tokens_per_frame_base,
                     device=emb.device,
                 )
-                emb = emb[retention_mask]
+                if pruning_stage != _VIDEO_PRUNE_STAGE_RGB_PRE_VIT:
+                    emb = emb[retention_mask]
             elif self.is_multimodal_pruning_enabled:
                 # For each video, compute retention mask using EVS.
                 # retention_mask: [11424].
