@@ -2486,7 +2486,11 @@ class Qwen3VLForConditionalGeneration(
             select_token_id=self.is_multimodal_pruning_enabled,
         )
 
-        repl_token_ids = torch.tensor(video_repl.full)
+        repl_token_ids = torch.tensor(
+            video_repl.full,
+            device=video_embeddings.device,
+            dtype=torch.long,
+        )
         embed_token_id = _cached_tensor(
             self.config.video_token_id, repl_token_ids.device
         )
