@@ -276,10 +276,16 @@ def _build_retention_mask_from_keep_indices(
 
 _VIDEO_PRUNE_STAGE_EMBEDDING = "embedding"
 _VIDEO_PRUNE_STAGE_RGB_PRE_VIT = "rgb_pre_vit"
+_VIDEO_PRUNE_STAGE_CODE_EMBEDDING = 0
+_VIDEO_PRUNE_STAGE_CODE_RGB_PRE_VIT = 1
 
 
 def _normalize_video_token_pruning_stage(stage: Any) -> str:
     if stage is None:
+        return _VIDEO_PRUNE_STAGE_RGB_PRE_VIT
+    if isinstance(stage, (int, np.integer)):
+        if int(stage) == _VIDEO_PRUNE_STAGE_CODE_RGB_PRE_VIT:
+            return _VIDEO_PRUNE_STAGE_RGB_PRE_VIT
         return _VIDEO_PRUNE_STAGE_EMBEDDING
     stage_str = str(stage).strip().lower()
     if stage_str in {
@@ -301,6 +307,13 @@ def _normalize_video_token_pruning_stage(stage: Any) -> str:
         _VIDEO_PRUNE_STAGE_EMBEDDING,
     )
     return _VIDEO_PRUNE_STAGE_EMBEDDING
+
+
+def _encode_video_token_pruning_stage(stage: Any) -> int:
+    normalized = _normalize_video_token_pruning_stage(stage)
+    if normalized == _VIDEO_PRUNE_STAGE_RGB_PRE_VIT:
+        return _VIDEO_PRUNE_STAGE_CODE_RGB_PRE_VIT
+    return _VIDEO_PRUNE_STAGE_CODE_EMBEDDING
 
 
 def _resolve_video_token_pruning_stage(
@@ -1027,12 +1040,23 @@ class Qwen3_VisionTransformer(nn.Module):
         rotary_cos = cos[selected_pos_ids].flatten(1)
         rotary_sin = sin[selected_pos_ids].flatten(1)
 
+        # Keep cu_seqlens strictly int32 for flash-attn varlen kernels.
         cu_seqlens = np.concatenate(
             [
                 np.zeros(1, dtype=np.int32),
-                np.cumsum(np.array(frame_patch_counts, dtype=np.int32)),
+                np.cumsum(np.array(frame_patch_counts, dtype=np.int32), dtype=np.int32),
             ]
+        ).astype(np.int32, copy=False)
+        recomputed_cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+            self.attn_backend,
+            cu_seqlens,
+            self.hidden_size,
+            self.tp_size,
+            device,
         )
+        if isinstance(recomputed_cu_seqlens, torch.Tensor):
+            recomputed_cu_seqlens = recomputed_cu_seqlens.to(dtype=torch.int32)
+
         metadata: dict[str, torch.Tensor | None] = {
             "pos_embeds": pos_embeds,
             "rotary_pos_emb_cos": rotary_cos,
@@ -1044,13 +1068,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
                 dtype=torch.int32,
             ),
-            "cu_seqlens": MMEncoderAttention.maybe_recompute_cu_seqlens(
-                self.attn_backend,
-                cu_seqlens,
-                self.hidden_size,
-                self.tp_size,
-                device,
-            ),
+            "cu_seqlens": recomputed_cu_seqlens,
         }
         return metadata
 
@@ -1667,7 +1685,9 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     )
                     normalized_token_keep_indices = None
                 video_token_keep_indices_lst.append(normalized_token_keep_indices)
-                video_token_pruning_stage_lst.append(user_token_pruning_stage)
+                video_token_pruning_stage_lst.append(
+                    _encode_video_token_pruning_stage(user_token_pruning_stage)
+                )
 
                 # Apply EVS if enabled.
                 video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
