@@ -173,6 +173,16 @@ class MultiModalConfig:
     Value sits in range [0;1) and determines fraction of media tokens
     from each video to be pruned.
     """
+    video_pruning_method: Literal["evs", "divprune"] = "evs"
+    """Visual token pruning method used when `video_pruning_rate` is enabled.
+    - "evs": Efficient Video Sampling (default)
+    - "divprune": Max-Min diversity pruning (DivPrune)
+    """
+    video_divprune_exact_threshold: int = Field(default=4096, gt=0)
+    """For DivPrune first-token initialization, use exact nearest-neighbor
+    search when token count <= this threshold; otherwise use centroid-farthest
+    initialization for lower overhead.
+    """
     mm_tensor_ipc: MMTensorIPC = "direct_rpc"
     """IPC (inter-process communication) method for multimodal tensors.
     - "direct_rpc": Use msgspec serialization via RPC

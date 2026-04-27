@@ -328,6 +328,8 @@ class ModelConfig:
     interleave_mm_strings: InitVar[bool | None] = None
     skip_mm_profiling: InitVar[bool | None] = None
     video_pruning_rate: InitVar[float | None] = None
+    video_pruning_method: InitVar[str | None] = None
+    video_divprune_exact_threshold: InitVar[int | None] = None
     mm_tensor_ipc: InitVar[MMTensorIPC] = None
 
     def compute_hash(self) -> str:
@@ -449,6 +451,8 @@ class ModelConfig:
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
+        video_pruning_method: str | None,
+        video_divprune_exact_threshold: int | None,
         mm_tensor_ipc: MMTensorIPC,
     ) -> None:
         # Keep set served_model_name before maybe_model_redirect(self.model)
@@ -643,6 +647,8 @@ class ModelConfig:
                 interleave_mm_strings=interleave_mm_strings,
                 skip_mm_profiling=skip_mm_profiling,
                 video_pruning_rate=video_pruning_rate,
+                video_pruning_method=video_pruning_method,
+                video_divprune_exact_threshold=video_divprune_exact_threshold,
                 mm_tensor_ipc=mm_tensor_ipc,
             )
 
